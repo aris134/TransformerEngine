@@ -6,7 +6,6 @@ set(CMAKE_CXX_STANDARD 20)
 #TODO: remove after figuring out how to install clang-scan-deps
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 project(ck_fused_attn LANGUAGES HIP CXX)
-# generate fused attn kernels, both fwd/bwd
 
 # remove files that should be regenerated
 file(REMOVE_RECURSE ${CMAKE_CURRENT_BINARY_DIR}/gen_src/tmp ${CMAKE_CURRENT_BINARY_DIR}/gen_src/blob_list.txt)

@@ -5,6 +5,9 @@
  ************************************************************************/
 
 #include <utility>
+#include <dlfcn.h>
+#include <filesystem>
+#include <mutex> //once_flag
 #include "ck_fused_attn_utils.hpp"
 #include "ck_fused_attn/ck_fused_attn.hpp"
 #include "mask.hpp"
@@ -36,7 +39,7 @@ void set_aiter_asm_dir() {
     Dl_info info;
     dladdr((void*)set_aiter_asm_dir, &info);
     setenv("AITER_ASM_DIR",
-           (std::filesystem::path(info.dli_fname).parent_path() / "aiter" / arh_str).c_str(), 1);
+           (std::filesystem::path(info.dli_fname).parent_path() / "aiter" / arh_str).c_str(), 0);
     // Print the set environment variable for debugging purposes
     std::cout << "AITER_ASM_DIR set to: " << getenv("AITER_ASM_DIR") << std::endl;
   });
