@@ -270,6 +270,33 @@ else()
         set(gfx942_key MI300X)
         set(gfx1100_key Navi31)
 
+      string(REPLACE ";" "," ARCH_LIST_COMMA_STR "${CMAKE_HIP_ARCHITECTURES}")
+      include(ExternalProject)
+      ExternalProject_Add(aotriton_external
+        LIST_SEPARATOR ","
+        SOURCE_DIR ${TE}/3rdparty/aotriton
+        CMAKE_ARGS -DCMAKE_INSTALL_PREFIX:PATH=${__AOTRITON_INSTALL_DIR}
+        -DAOTRITON_TARGET_ARCH=${ARCH_LIST_COMMA_STR}
+        -DGPU_TARGETS=${ARCH_LIST_COMMA_STR}
+        -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+        -DAOTRITON_NO_PYTHON=ON
+        -DAOTRITON_NAME_SUFFIX=${__AOTRITON_SUFFIX}
+        -DAOTRITON_NOIMAGE_MODE=${AOTRITON_NOIMAGE_MODE}
+        BUILD_BYPRODUCTS "${__AOTRITON_INSTALL_DIR}/lib/libaotriton${__AOTRITON_SUFFIX}_v2.so"
+        )
+      add_library(aotriton INTERFACE)
+      add_dependencies(aotriton aotriton_external)
+      target_link_libraries(aotriton INTERFACE ${__AOTRITON_INSTALL_DIR}/lib/libaotriton${__AOTRITON_SUFFIX}_v2.so)
+      target_include_directories(aotriton INTERFACE ${__AOTRITON_INSTALL_DIR}/include)
+      if(NOT USE_FUSED_ATTN_AOTRITON_BUILD_GPU_KERNELS)
+        set(__AOTRITON_VER "0.10b")
+        set(__AOTRITON_SHA256 "1e9b3dddf0c7fc07131c6f0f5266129e83ce2331f459fa2be8c63f4ae91b0f5b")
+        string(CONCAT __AOTRITON_URL "https://github.com/ROCm/aotriton/releases/download/"
+                                    "${__AOTRITON_VER}/aotriton-"
+                                    "${__AOTRITON_VER}-manylinux_2_28"
+                                    "_x86_64-rocm7.0"
+                                    "-shared.tar.gz")
+        set(aotriton_image_dirs)
         foreach(X IN LISTS CMAKE_HIP_ARCHITECTURES)
           set(key ${X})
           string(APPEND key "_key")
