@@ -170,7 +170,11 @@ list(APPEND transformer_engine_SOURCES
      fused_router/fused_topk_with_score_function.cu
      recipe/current_scaling.cu
      recipe/delayed_scaling.cu
-     recipe/fp8_block_scaling.cu)
+     recipe/fp8_block_scaling.cu
+     comm_gemm_overlap/userbuffers/ipcsocket.cc
+     comm_gemm_overlap/userbuffers/userbuffers-host.cpp
+     comm_gemm_overlap/userbuffers/userbuffers.cu
+     comm_gemm_overlap/comm_gemm_overlap.cpp)
 if(USE_CUDA)
 # Removed indent to minimize code diff with NV upstream
 # Files unique in cuda building
@@ -184,11 +188,7 @@ list(APPEND transformer_engine_SOURCES
      fused_attn/fused_attn.cpp
      fused_attn/utils.cu
      gemm/cutlass_grouped_gemm.cu
-     util/cuda_nvml.cpp
-     comm_gemm_overlap/userbuffers/ipcsocket.cc
-     comm_gemm_overlap/userbuffers/userbuffers-host.cpp
-     comm_gemm_overlap/userbuffers/userbuffers.cu
-     comm_gemm_overlap/comm_gemm_overlap.cpp)
+     util/cuda_nvml.cpp)
 
 if (NVTE_WITH_CUBLASMP)
 list(APPEND transformer_engine_SOURCES
@@ -203,7 +203,8 @@ else()
        fused_attn_rocm/fused_attn_ck.cpp
        fused_attn_rocm/utils.cpp
        gemm/rocm_gemm.cu
-       amd_detail/system.cpp)
+       amd_detail/system.cpp
+       comm_gemm_overlap/rocm_comm_gemm_overlap.cpp)
 
   # process source code files
   set(TE ${CMAKE_CURRENT_SOURCE_DIR}/../..)
@@ -270,11 +271,15 @@ target_include_directories(transformer_engine PRIVATE
                           ${CUTLASS_TOOLS_INCLUDE_DIR})
 
 # Compiling Userbuffers with native MPI bootstrapping requires linking against MPI
+# Changed
 option(NVTE_UB_WITH_MPI "Bootstrap Userbuffers with MPI" OFF)
 if (NVTE_UB_WITH_MPI)
-    find_package(MPI REQUIRED)
-    target_link_libraries(transformer_engine PUBLIC MPI::MPI_CXX)
-    target_include_directories(transformer_engine PRIVATE ${MPI_CXX_INCLUDES})
+    # OpenMPI C++ headers are deprecated -- flag unused w/ MPICH
+    add_definitions(-DOMPI_SKIP_MPICXX)
+    
+    target_include_directories(transformer_engine PRIVATE "$ENV{MPI_HOME}/include")
+    target_link_directories(transformer_engine PRIVATE "$ENV{MPI_HOME}/lib")
+    target_link_libraries(transformer_engine PUBLIC mpi)
     target_compile_definitions(transformer_engine PUBLIC NVTE_UB_WITH_MPI)
 endif()
 
@@ -451,7 +456,7 @@ endif()
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --threads ${BUILD_THREADS_PER_JOB}")
 message(STATUS "Threads per parallel build job: ${BUILD_THREADS_PER_JOB}")
 else()
-  set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -O3")
+  set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -O3 -fopenmp")
   set(HIP_HCC_FLAGS "${CMAKE_HIP_FLAGS} -mavx2 -mf16c -mfma -std=c++17")
   # Ask hcc to generate device code during compilation so we can use
   # host linker to link.

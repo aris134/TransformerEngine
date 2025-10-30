@@ -357,12 +357,12 @@ int create_communicator_grouped2(communicator **comm, int myrank, int numranks, 
   NVTE_CHECK_CUDA(cudaDeviceSynchronize());
   register_user_buffer_collective(&((*comm)->gpu_ptrs), LOCALSIZE, *comm, true);
   NVTE_CHECK_CUDA(
-      cudaMalloc(reinterpret_cast<void **>(&(*comm)->send_id), (*comm)->nranks * sizeof(int)));
+      cudaMalloc(reinterpret_cast<void **>(&(*comm)->send_id), (*comm)->nranks * NVTE_MAX_RINGS * sizeof(int)));
   NVTE_CHECK_CUDA(cudaMalloc(reinterpret_cast<void **>(&(*comm)->recv_id),
-                             NVTE_MAX_REGIONS * (*comm)->nranks * sizeof(int)));
-  NVTE_CHECK_CUDA(cudaMemset((*comm)->send_id, 0, (*comm)->nranks * sizeof(int)));
+                             NVTE_MAX_REGIONS * (*comm)->nranks * NVTE_MAX_RINGS * sizeof(int)));
+  NVTE_CHECK_CUDA(cudaMemset((*comm)->send_id, 0, (*comm)->nranks * NVTE_MAX_RINGS * sizeof(int)));
   NVTE_CHECK_CUDA(
-      cudaMemset((*comm)->recv_id, 0, NVTE_MAX_REGIONS * (*comm)->nranks * sizeof(int)));
+      cudaMemset((*comm)->recv_id, 0, NVTE_MAX_REGIONS * (*comm)->nranks * NVTE_MAX_RINGS * sizeof(int)));
   (*comm)->sms = 16;
   (*comm)->threads = 1024;
 
@@ -375,8 +375,11 @@ int create_communicator_grouped2(communicator **comm, int myrank, int numranks, 
       cudaMalloc(reinterpret_cast<void **>(&(*comm)->flags_baseptr), 2 * GPU_PAGE_SIZE));
   NVTE_CHECK_CUDA(cudaMemset((*comm)->flags_baseptr, 0, 2 * GPU_PAGE_SIZE));
   (*comm)->flags = reinterpret_cast<int *>(
+#ifdef __HIP_PLATFORM_AMD__
+      (reinterpret_cast<uintptr_t>((*comm)->flags) + GPU_PAGE_SIZE - 1) & GPU_PAGE_MASK);
+#else
       ((CUdeviceptr)(*comm)->flags_baseptr + GPU_PAGE_SIZE - 1) & GPU_PAGE_MASK);
-
+#endif
   using namespace std;
 
   sched_param param;
@@ -670,9 +673,36 @@ int register_user_buffer_collective(void **gpubuff, size_t bytes, communicator *
                      reinterpret_cast<void *>(&memhndl), sizeof(cudaIpcMemHandle_t),
                      comm->comm_intra);
 
+    // Check for NVLINK support before attempting IPC operations
+    if (comm->nvsize > 1) {
+      int current_device;
+      NVTE_CHECK_CUDA(cudaGetDevice(&current_device));
+      cudaDeviceProp deviceProp;
+      NVTE_CHECK_CUDA(cudaGetDeviceProperties(&deviceProp, current_device));
+      bool peer_access_available = false;
+      for (int i = 0; i < comm->nvsize; i++) {
+        if (i != comm->nvrank) {
+          int can_access_peer;
+          cudaError_t peer_result = cudaDeviceCanAccessPeer(&can_access_peer, current_device, i);
+          if (peer_result == cudaSuccess && can_access_peer) {
+            peer_access_available = true;
+            break;
+          }
+        }
+      }
+      if (!peer_access_available) {
+        free(tmp);
+        NVTE_ERROR(
+            "No peer-to-peer access available between GPUs. This platform does not support the "
+            "GPU-to-GPU "
+            "communication required for multi-GPU userbuffers. Consider using single-GPU mode.");
+        return 1;
+      }
+    }
+
     for (int i = 0; i < comm->nvsize; i++) {
       if (i != comm->nvrank) {
-        NVTE_CHECK_CUDA(cudaIpcOpenMemHandle(&(comm->peer_ptr[hndl][i]), tmp[i],  // NOLINT(*)
+        NVTE_CHECK_CUDA(cudaIpcOpenMemHandle(&(comm->peer_ptr[hndl][i]), tmp[i],
                                              cudaIpcMemLazyEnablePeerAccess));
       }
     }
@@ -693,4 +723,5 @@ int register_user_buffer_collective(void **gpubuff, size_t bytes, communicator *
   comm->mem_ptr[hndl] = *gpubuff;
 
   return comm->free_region++;
+  printf("***** Returning *****\n");
 }

@@ -89,6 +89,8 @@ run_test_config_mgpu(){
     configure_omp_threads 8
     run_default_fa 1 test_fused_optimizer.py
     run_default_fa 3 test_sanity_import.py
+    run_default_fa 3 distributed/test_fusible_ops_with_userbuffers.py
+    run_default_fa 3 distributed/test_comm_gemm_overlap.py
     run_default_fa 2 distributed/test_fusible_ops.py
     run_default_fa 2 distributed/test_numerics.py
     run_default_fa 1 distributed/test_torch_fsdp2.py

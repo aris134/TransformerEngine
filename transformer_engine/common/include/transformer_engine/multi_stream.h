@@ -1,4 +1,6 @@
 /*************************************************************************
+ * This file was modified for portability to AMDGPU
+ * Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
  * Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  * See LICENSE for license information.
@@ -11,7 +13,11 @@
 #ifndef TRANSFORMER_ENGINE_MULTI_STREAM_H
 #define TRANSFORMER_ENGINE_MULTI_STREAM_H
 
+#ifdef __HIP_PLATFORM_AMD__
+#include "util/hip_runtime.h"
+#else
 #include "cuda_runtime.h"
+#endif
 
 #ifdef __cplusplus
 extern "C" {

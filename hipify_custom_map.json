@@ -6,7 +6,14 @@
         "ATen/cudnn/Handle.h" : "ATen/miopen/Handle.h",
         "CUfunc_cache" : "hipFuncCache_t", 
         "<nvtx3/nvToolsExt.h>" : "<roctracer/roctx.h>",
-        "cudaFuncSetAttribute(" : "hipFuncSetAttribute((const void*)"
+        "cudaFuncSetAttribute(" : "hipFuncSetAttribute((const void*)",
+        "cudaLaunchKernel": "hipLaunchKernel",
+        "CUmemGenericAllocationHandle": "hipMemGenericAllocationHandle_t",
+        "\"cuda_runtime.h\"": "\"hip_runtime.h\"",
+        "cudaLaunchConfig_t": "hipLaunchConfig_t",
+        "cudaLaunchAttribute": "hipLaunchAttribute",
+        "cudaLaunchAttributeCooperative": "hipLaunchAttributeCooperative",
+        "CUdeviceptr": "hipDeviceptr_t"
  }
 }
 
