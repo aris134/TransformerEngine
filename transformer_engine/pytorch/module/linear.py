@@ -68,6 +68,8 @@ from ..tensor.quantized_tensor import (
 from ..tensor.float8_tensor import Float8CurrentScalingQuantizer, Float8Quantizer
 from ..tensor.mxfp8_tensor import MXFP8Quantizer
 from ..tensor._internal.mxfp8_tensor_base import MXFP8TensorBase
+from ..tensor.mxfp4_tensor import MXFP4Quantizer
+from ..tensor._internal.mxfp4_tensor_base import MXFP4TensorBase
 from ..tensor.float8_blockwise_tensor import Float8BlockQuantizer
 from ..cpu_offload import is_cpu_offload_enabled, mark_activation_offload
 from ...debug.pytorch.debug_state import TEDebugState
@@ -1422,6 +1424,74 @@ class Linear(TransformerEngineBaseModule):
     def _get_quantizers(self, fp8_output, fp8_grad):
         if not self.fp8:
             return [None] * 6
+
+        ############ MXFP4 OVERRIDE  ############
+        import os
+        force_fp4 = int(os.getenv('FP4', '0')) == 1
+        
+        if force_fp4:
+            # Hardcoded MXFP4 path: Forward uses FP4, backward uses high precision
+            # Force create MXFP4 quantizers if they don't exist
+            if not hasattr(self, '_mxfp4_quantizers_created'):
+                # Create MXFP4 quantizers
+                from ..tensor.mxfp4_tensor import MXFP4Quantizer
+                import transformer_engine_torch as tex
+                
+                mxfp4_quantizer = MXFP4Quantizer(fp4_dtype=tex.DType.kFloat4E2M1)
+                
+                # Override the quantizers with MXFP4 ones
+                self.quantizers["scaling_fwd"][tex.FP8FwdTensors.GEMM1_INPUT] = mxfp4_quantizer
+                self.quantizers["scaling_fwd"][tex.FP8FwdTensors.GEMM1_WEIGHT] = MXFP4Quantizer(fp4_dtype=tex.DType.kFloat4E2M1)
+                
+                self._mxfp4_quantizers_created = True
+                print(f"[OVERRIDE] Linear layer forced to use MXFP4 quantizers")
+            
+            input_quantizer = self.quantizers["scaling_fwd"][tex.FP8FwdTensors.GEMM1_INPUT]
+            weight_quantizer = self.quantizers["scaling_fwd"][tex.FP8FwdTensors.GEMM1_WEIGHT]
+            
+            if input_quantizer is not None:
+                input_quantizer.internal = True
+            if weight_quantizer is not None:
+                weight_quantizer.internal = True
+                if IS_HIP_EXTENSION:
+                    weight_quantizer.set_usage(columnwise = self.keep_fp8_weight_transpose_cache)
+            
+            # MXFP4 backward uses high precision (None quantizers)
+            return (
+                input_quantizer,
+                weight_quantizer,
+                None,  # output_quantizer - no FP4 output quantization
+                None,  # grad_input_quantizer - high precision backward
+                None,  # grad_weight_quantizer - high precision backward
+                None,  # grad_output_quantizer - high precision backward
+            )
+        ############ END OVERRIDE ############
+
+        # Check if we're using MXFP4 recipe
+        recipe = FP8GlobalStateManager.get_fp8_recipe()
+        if recipe.mxfp4():
+            # MXFP4: Forward pass uses FP4, backward pass uses high precision
+            input_quantizer = self.quantizers["scaling_fwd"][tex.FP8FwdTensors.GEMM1_INPUT]
+            weight_quantizer = self.quantizers["scaling_fwd"][tex.FP8FwdTensors.GEMM1_WEIGHT]
+            
+            if input_quantizer is not None:
+                input_quantizer.internal = True
+            if weight_quantizer is not None:
+                weight_quantizer.internal = True
+                if IS_HIP_EXTENSION:
+                    weight_quantizer.set_usage(columnwise = self.keep_fp8_weight_transpose_cache)
+            
+            # MXFP4 backward uses high precision (None quantizers)
+            return (
+                input_quantizer,
+                weight_quantizer,
+                None,  # output_quantizer - no FP4 output quantization
+                None,  # grad_input_quantizer - high precision backward
+                None,  # grad_weight_quantizer - high precision backward
+                None,  # grad_output_quantizer - high precision backward
+            )
+
+        # Standard FP8 path
         grad_input_quantizer = None
         grad_weight_quantizer = None
         grad_output_quantizer = None
