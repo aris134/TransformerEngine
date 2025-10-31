@@ -1,5 +1,6 @@
 # Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-#
+
+# This file was modified for portability to AMDGPU
 # See LICENSE for license information.
 
 """Python interface for GEMM extensions"""
@@ -41,6 +42,59 @@ def general_gemm(
     bulk_overlap: bool = False,
 ) -> Iterable[Optional[torch.Tensor]]:
     """GEMM supporting fp8 inputs."""
+
+    # MXFP4 forward pass dispatch to AITER
+    from ..tensor._internal.mxfp4_tensor_base import MXFP4TensorBase
+    if isinstance(A, MXFP4TensorBase) and isinstance(B, MXFP4TensorBase):
+        # Import AITER for FP4 GEMM
+        try:
+            import aiter
+        except ImportError:
+            raise ImportError(
+                "AITER library not found. Please install AITER to use MXFP4 GEMM. "
+                "Install via: pip install -e /path/to/aiter"
+            )
+
+        # Extract MXFP4 data and scales
+        # A is activation (input): use rowwise data
+        # B is weight: use rowwise data (will be transposed in GEMM)
+        A_data = A._rowwise_data  # [M, K/2] uint8
+        A_scale = A._rowwise_scale  # [M, K/32] uint8 E8M0
+        B_data = B._rowwise_data  # [N, K/2] uint8
+        B_scale = B._rowwise_scale  # [N, K/32] uint8 E8M0
+
+        # Determine output shape
+        M = A_data.shape[0]
+        N = B_data.shape[0]
+
+        # Prepare output tensor
+        if out is None:
+            out = torch.empty(
+                M, N,
+                dtype=out_dtype if out_dtype is not None else torch.bfloat16,
+                device=A_data.device
+            )
+
+        # Call AITER gemm_a4w4
+        # Note: AITER expects layout where both A and B are rowwise stored
+        aiter.gemm_a4w4(
+            A_data,
+            B_data,
+            A_scale,
+            B_scale,
+            out,
+            bias=bias,
+            alpha=1.0,
+            beta=0.0 if not accumulate else 1.0,
+            bpreshuffle=True,
+        )
+
+        # MXFP4 does not support GELU fusion yet
+        if gelu:
+            raise NotImplementedError("GELU fusion not supported with MXFP4")
+
+        # Return in the same format as generic_gemm
+        return out, None, None, extra_output
 
     assert layout in ("TN", "NN", "NT"), f"GEMM layout {layout} not supported."
     transa = layout[0] == "T"
