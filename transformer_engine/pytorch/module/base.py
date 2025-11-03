@@ -26,7 +26,7 @@ from transformer_engine.common.recipe import Recipe
 from ._common import _ParameterInitMeta, noop_cat
 from ..fp8 import (
     MXFP8BlockScalingRecipeState,
-    MXFP4BlockScalingRecipeState,
+    # MXFP4BlockScalingRecipeState,  # Not needed for FP4=1 env var hack
     DelayedScalingRecipeState,
     Float8CurrentScalingRecipeState,
     Float8BlockScalingRecipeState,
@@ -685,8 +685,8 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                 return
             if recipe.mxfp8() and isinstance(recipe_state, MXFP8BlockScalingRecipeState):
                 return
-            if recipe.mxfp4() and isinstance(recipe_state, MXFP4BlockScalingRecipeState):
-                return
+            # if recipe.mxfp4() and isinstance(recipe_state, MXFP4BlockScalingRecipeState):
+            #     return
             if recipe.float8_current_scaling() and isinstance(
                 recipe_state, Float8CurrentScalingRecipeState
             ):
