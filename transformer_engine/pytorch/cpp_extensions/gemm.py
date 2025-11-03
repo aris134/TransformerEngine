@@ -46,6 +46,7 @@ def general_gemm(
     # MXFP4 forward pass dispatch to AITER
     from ..tensor._internal.mxfp4_tensor_base import MXFP4TensorBase
     if isinstance(A, MXFP4TensorBase) and isinstance(B, MXFP4TensorBase):
+        print(f"[{__file__}] [MXFP4 GEMM] Dispatching to AITER gemm_a4w4: A={A._rowwise_data.shape}, B={B._rowwise_data.shape}")
         # Import AITER for FP4 GEMM
         try:
             import aiter

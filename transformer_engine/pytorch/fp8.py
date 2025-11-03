@@ -22,6 +22,7 @@ from transformer_engine.common.recipe import (
     DelayedScaling,
     Format,
     MXFP8BlockScaling,
+    # TODO: Add MXFP4BlockScaling when removing hack from linear.py
     Float8CurrentScaling,
     Float8BlockScaling,
 )
@@ -836,6 +837,9 @@ class RecipeState(abc.ABC):
             cls = DelayedScalingRecipeState
         elif recipe.mxfp8():
             cls = MXFP8BlockScalingRecipeState
+        # TODO: complete MXFP4 recipe integration
+        # elif recipe.mxfp4():
+        #     cls = MXFP4BlockScalingRecipeState
         elif recipe.float8_current_scaling():
             cls = Float8CurrentScalingRecipeState
         elif recipe.float8_block_scaling():

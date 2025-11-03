@@ -36,10 +36,11 @@ class _FormatMaxVals(Enum):
     """
     E4M3 = (448, 240)
     E5M2 = (57344, 57344)
+    E2M1 = (6, 6)  # FP4 E2M1 format max value
 
 class Format(Enum):
     """
-    Supported FP8 formats.
+    Supported FP8/FP4 formats.
 
     Values
     ------
@@ -50,10 +51,13 @@ class Format(Enum):
     HYBRID :
             FP8 tensors in the forward pass are in e4m3 format,
             FP8 tensors in the backward pass are in e5m2 format
+    E2M1 :
+          FP4 E2M1 format (2 bits exponent, 1 bit mantissa)
     """
     E4M3 = _FormatHelper(fwd=_FormatMaxVals.E4M3.value, bwd=_FormatMaxVals.E4M3.value) 
     E5M2 = _FormatHelper(fwd=_FormatMaxVals.E5M2.value, bwd=_FormatMaxVals.E5M2.value)
     HYBRID = _FormatHelper(fwd=E4M3.fwd, bwd=E5M2.bwd)
+    E2M1 = _FormatHelper(fwd=_FormatMaxVals.E2M1.value, bwd=_FormatMaxVals.E2M1.value)
 
 
 @dataclass(frozen=True)
@@ -85,6 +89,12 @@ class Recipe:
     def mxfp8(self):
         """Whether the given recipe is MXFP8 block scaling."""
         return isinstance(self, MXFP8BlockScaling)
+
+    def mxfp4(self):
+        """Whether the given recipe is MXFP4 block scaling."""
+        # TODO: Uncomment when removing hack from linear.py
+        # return isinstance(self, MXFP4BlockScaling)
+        return False
 
     def delayed(self):
         """Whether the given recipe is delayed scaling."""
