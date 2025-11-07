@@ -65,6 +65,14 @@ class MXFP4Quantizer(Quantizer):
         if not src.is_contiguous():
             src = src.contiguous()
 
+        # MXFP4 only supports 2D tensors (matrices) for AITER gemm_a4w4
+        if src.dim() != 2:
+            raise ValueError(
+                f"MXFP4 quantization requires 2D tensors for AITER gemm_a4w4, "
+                f"but got tensor with shape {src.shape} (dim={src.dim()}). "
+                f"Biases and other 1D tensors should not be quantized with MXFP4."
+            )
+
         try:
             import aiter
         except ImportError:
