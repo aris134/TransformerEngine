@@ -57,59 +57,84 @@ def general_gemm(
     if isinstance(A, MXFP4TensorBase) and isinstance(B, MXFP4TensorBase):
         try:
             import aiter
+            from aiter.ops.shuffle import shuffle_weight
         except ImportError:
             raise ImportError(
                 "AITER library not found. Please install AITER to use MXFP4 GEMM. "
                 "Install via: pip install -e /path/to/aiter"
             )
 
-        A_data = A._rowwise_data  # [M, K/2] uint8
-        A_scale = A._rowwise_scale  # [M, K/32] uint8 E8M0
-        B_data = B._rowwise_data  # [N, K/2] uint8
-        B_scale = B._rowwise_scale  # [N, K/32] uint8 E8M0
+        # TransformerEngine calls general_gemm(weight, input, ...)
+        # But AITER expects gemm_a4w4_asm(input, weight, ...)
+        weight_data = A._rowwise_data  # [N, K/2] where N = output_features
+        weight_scale = A._rowwise_scale  # [N, K/32]
+        input_data = B._rowwise_data  # [M, K/2] where M = batch_size
+        input_scale = B._rowwise_scale  # [M, K/32]
 
-        M = A_data.shape[0]
-        N = B_data.shape[0]
+        M = input_data.shape[0]   # Batch dimension (from input)
+        N = weight_data.shape[0]  # Output features (from weight)
 
+        # Pad M to multiple of 32 for AITER kernel requirements
+        padded_M = (M + 31) // 32 * 32
+        
         if out is None:
             out = torch.empty(
-                M, N,
+                padded_M, N,
                 dtype=out_dtype if out_dtype is not None else torch.bfloat16,
-                device=A_data.device
+                device=input_data.device
             )
 
-        result = aiter.gemm_a4w4(
-            A_data,
-            B_data,
-            A_scale,
-            B_scale,
-            out,
-            bias=bias,
-            alpha=1.0,
-            beta=0.0 if not accumulate else 1.0,
-            bpreshuffle=True,
-        )
+        # Shuffle weight for FP4 layout (16x16) and call gemm_a4w4_asm
+        # AITER expects: gemm_a4w4_asm(input, weight_shuffled, input_scale, weight_scale, ...)
+        # Wrap in DisableTorchDispatch to prevent recursive dequantization, TODO revisit DisableTorchDispatch
+        with torch._C._DisableTorchDispatch():
+            weight_layout = (16, 16)
+            weight_data_shuffled = shuffle_weight(weight_data, layout=weight_layout)
+            
+            result = aiter.gemm_a4w4_asm(
+                input_data,              
+                weight_data_shuffled,    
+                input_scale,             
+                weight_scale,            
+                out,
+                "" if bias is None else bias,  
+                None,
+                bpreshuffle=True,
+                log2_k_split=0,
+            )
+            
+            # Trim padding if necessary
+            if result.shape[0] > M:
+                result = result[:M, :]
+            
+            # Reshape output back to original shape 
+            original_input_shape = getattr(B, '_original_shape', None)  # Changed from A to B (input)
+            if original_input_shape is not None and len(original_input_shape) > 2:
+                # Reshape [M, N] -> [..., N] where ... matches the original leading dims
+                output_shape = list(original_input_shape[:-1]) + [N]
+                result = result.view(output_shape)
 
         if os.getenv("NVTE_MXFP4_DEBUG", "0") == "1":
             print_rank_0(
-                "[MXFP4 GEMM] Dispatching to AITER gemm_a4w4: "
-                f"A_shape={A._rowwise_data.shape}, B_shape={B._rowwise_data.shape}\n"
-                f"A_data shape={A_data.shape}, dtype={A_data.dtype}; "
-                f"A_scale shape={A_scale.shape}, dtype={A_scale.dtype} | "
-                f"B_data shape={B_data.shape}, dtype={B_data.dtype}; "
-                f"B_scale shape={B_scale.shape}, dtype={B_scale.dtype}\n"
-                f"Calling aiter.gemm_a4w4: M={M}, N={N}, "
-                f"bias_shape={bias.shape if bias is not None else None}, "
-                f"out_shape={out.shape}, M%32={M % 32}, N%32={N % 32}\n"
-                "AITER gemm_a4w4 returned successfully"
+                f"[{__file__}] [MXFP4 DEBUG] Dispatching to AITER gemm_a4w4_asm:\t"
+                f"  Weight (A) shape={weight_data.shape}, dtype={weight_data.dtype}; "
+                f"scales shape={weight_scale.shape}, dtype={weight_scale.dtype}\t"
+                f"  Input (B) shape={input_data.shape}, dtype={input_data.dtype}; "
+                f"scales shape={input_scale.shape}, dtype={input_scale.dtype}\t"
+                f"  Weight shuffled shape={weight_data_shuffled.shape}\t"
+                f"  Calling aiter.gemm_a4w4_asm: M={M} (padded to {padded_M}), N={N}, "
+                f"bias={'None' if bias is None else 'provided'}, "
+                f"out_shape={out.shape}, result_shape (before reshape)={result.shape}\t"
+                f"  Original input shape: {original_input_shape}, final result shape: {result.shape}\t"
+                "  AITER gemm_a4w4_asm returned successfully"
             )
 
         # MXFP4 does not support GELU fusion yet
         if gelu:
             raise NotImplementedError("GELU fusion not supported with MXFP4")
 
-        # Return in the same format as generic_gemm
-        return out, None, None, extra_output
+        # Return in the same format as generic_gemm (use reshaped result)
+        return result, None, None, extra_output
 
     assert layout in ("TN", "NN", "NT"), f"GEMM layout {layout} not supported."
     transa = layout[0] == "T"
