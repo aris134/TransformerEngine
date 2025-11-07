@@ -239,3 +239,22 @@ class MXFP4Tensor(MXFP4TensorBase, QuantizedTensor):
         quantizer = self._get_quantizer()
         return quantizer.update_quantized(tensor, self, noop_flag=noop_flag)
 
+    def contiguous(
+        self,
+        memory_format: torch.memory_format = torch.contiguous_format,
+    ) -> MXFP4Tensor:
+        """Returns tensor with data in provided memory format
+
+        Returns `self` if data is already in correct memory format.
+
+        """
+        if self._rowwise_data is not None and self._rowwise_data.is_contiguous(
+            memory_format=memory_format
+        ):
+            return self
+        if self._columnwise_data is not None and self._columnwise_data.is_contiguous(
+            memory_format=memory_format
+        ):
+            return self
+        raise ValueError("MXFP4Tensor does not support different memory formats!")
+

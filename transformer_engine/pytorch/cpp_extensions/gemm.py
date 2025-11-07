@@ -45,9 +45,10 @@ def general_gemm(
 
     # MXFP4 forward pass dispatch to AITER
     from ..tensor._internal.mxfp4_tensor_base import MXFP4TensorBase
+    import os
+
     if isinstance(A, MXFP4TensorBase) and isinstance(B, MXFP4TensorBase):
-        print(f"[{__file__}] [MXFP4 GEMM] Dispatching to AITER gemm_a4w4: A={A._rowwise_data.shape}, B={B._rowwise_data.shape}")
-        # Import AITER for FP4 GEMM
+        print(f"[{__file__}] [MXFP4 GEMM] Dispatching to AITER gemm_a4w4: A_shape={A._rowwise_data.shape}, B_shape={B._rowwise_data.shape}")
         try:
             import aiter
         except ImportError:
@@ -56,19 +57,20 @@ def general_gemm(
                 "Install via: pip install -e /path/to/aiter"
             )
 
-        # Extract MXFP4 data and scales
-        # A is activation (input): use rowwise data
-        # B is weight: use rowwise data (will be transposed in GEMM)
         A_data = A._rowwise_data  # [M, K/2] uint8
         A_scale = A._rowwise_scale  # [M, K/32] uint8 E8M0
         B_data = B._rowwise_data  # [N, K/2] uint8
         B_scale = B._rowwise_scale  # [N, K/32] uint8 E8M0
 
-        # Determine output shape
+        if os.getenv("NVTE_MXFP4_DEBUG", "0") == "1":
+            print(f"[{__file__}] [MXFP4 GEMM] A_data shape={A_data.shape}, dtype={A_data.dtype}; "
+                  f"A_scale shape={A_scale.shape}, dtype={A_scale.dtype} | "
+                  f"B_data shape={B_data.shape}, dtype={B_data.dtype}; "
+                  f"B_scale shape={B_scale.shape}, dtype={B_scale.dtype}")
+
         M = A_data.shape[0]
         N = B_data.shape[0]
 
-        # Prepare output tensor
         if out is None:
             out = torch.empty(
                 M, N,
@@ -76,9 +78,12 @@ def general_gemm(
                 device=A_data.device
             )
 
-        # Call AITER gemm_a4w4
-        # Note: AITER expects layout where both A and B are rowwise stored
-        aiter.gemm_a4w4(
+        if os.getenv("NVTE_MXFP4_DEBUG", "0") == "1":
+            print(f"[{__file__}] [MXFP4 GEMM] Calling aiter.gemm_a4w4: M={M}, N={N}, "
+                  f"bias_shape={bias.shape if bias is not None else None}, "
+                  f"out_shape={out.shape}, M%32={M % 32}, N%32={N % 32}")
+
+        result = aiter.gemm_a4w4(
             A_data,
             B_data,
             A_scale,
@@ -89,6 +94,8 @@ def general_gemm(
             beta=0.0 if not accumulate else 1.0,
             bpreshuffle=True,
         )
+        if os.getenv("NVTE_MXFP4_DEBUG", "0") == "1":
+            print(f"[{__file__}] [MXFP4 GEMM] AITER gemm_a4w4 returned successfully")
 
         # MXFP4 does not support GELU fusion yet
         if gelu:
