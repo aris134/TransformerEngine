@@ -22,6 +22,13 @@ __all__ = [
 ]
 
 
+def print_rank_0(*args, **kwargs):
+    """Print only from rank 0 to avoid duplicate logs in distributed training."""
+    import torch.distributed as dist
+    if (dist.get_rank() if dist.is_initialized() else 0) == 0:
+        print(*args, **kwargs)
+
+
 def general_gemm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -48,7 +55,6 @@ def general_gemm(
     import os
 
     if isinstance(A, MXFP4TensorBase) and isinstance(B, MXFP4TensorBase):
-        print(f"[{__file__}] [MXFP4 GEMM] Dispatching to AITER gemm_a4w4: A_shape={A._rowwise_data.shape}, B_shape={B._rowwise_data.shape}")
         try:
             import aiter
         except ImportError:
@@ -62,12 +68,6 @@ def general_gemm(
         B_data = B._rowwise_data  # [N, K/2] uint8
         B_scale = B._rowwise_scale  # [N, K/32] uint8 E8M0
 
-        if os.getenv("NVTE_MXFP4_DEBUG", "0") == "1":
-            print(f"[{__file__}] [MXFP4 GEMM] A_data shape={A_data.shape}, dtype={A_data.dtype}; "
-                  f"A_scale shape={A_scale.shape}, dtype={A_scale.dtype} | "
-                  f"B_data shape={B_data.shape}, dtype={B_data.dtype}; "
-                  f"B_scale shape={B_scale.shape}, dtype={B_scale.dtype}")
-
         M = A_data.shape[0]
         N = B_data.shape[0]
 
@@ -77,11 +77,6 @@ def general_gemm(
                 dtype=out_dtype if out_dtype is not None else torch.bfloat16,
                 device=A_data.device
             )
-
-        if os.getenv("NVTE_MXFP4_DEBUG", "0") == "1":
-            print(f"[{__file__}] [MXFP4 GEMM] Calling aiter.gemm_a4w4: M={M}, N={N}, "
-                  f"bias_shape={bias.shape if bias is not None else None}, "
-                  f"out_shape={out.shape}, M%32={M % 32}, N%32={N % 32}")
 
         result = aiter.gemm_a4w4(
             A_data,
@@ -94,8 +89,20 @@ def general_gemm(
             beta=0.0 if not accumulate else 1.0,
             bpreshuffle=True,
         )
+
         if os.getenv("NVTE_MXFP4_DEBUG", "0") == "1":
-            print(f"[{__file__}] [MXFP4 GEMM] AITER gemm_a4w4 returned successfully")
+            print_rank_0(
+                "[MXFP4 GEMM] Dispatching to AITER gemm_a4w4: "
+                f"A_shape={A._rowwise_data.shape}, B_shape={B._rowwise_data.shape}\n"
+                f"A_data shape={A_data.shape}, dtype={A_data.dtype}; "
+                f"A_scale shape={A_scale.shape}, dtype={A_scale.dtype} | "
+                f"B_data shape={B_data.shape}, dtype={B_data.dtype}; "
+                f"B_scale shape={B_scale.shape}, dtype={B_scale.dtype}\n"
+                f"Calling aiter.gemm_a4w4: M={M}, N={N}, "
+                f"bias_shape={bias.shape if bias is not None else None}, "
+                f"out_shape={out.shape}, M%32={M % 32}, N%32={N % 32}\n"
+                "AITER gemm_a4w4 returned successfully"
+            )
 
         # MXFP4 does not support GELU fusion yet
         if gelu:
