@@ -66,10 +66,14 @@ class MXFP4Quantizer(Quantizer):
             src = src.contiguous()
 
         # MXFP4 only supports 2D tensors (matrices) for AITER gemm_a4w4
+        # Reshape if needed (e.g. [N, 1, K] -> [N, K])
+        original_shape = src.shape
+        if src.dim() > 2:
+            src = src.view(-1, src.shape[-1])
         if src.dim() != 2:
             raise ValueError(
                 f"MXFP4 quantization requires 2D tensors for AITER gemm_a4w4, "
-                f"but got tensor with shape {src.shape} (dim={src.dim()}). "
+                f"but got tensor with shape {original_shape} (dim={len(original_shape)}). "
                 f"Biases and other 1D tensors should not be quantized with MXFP4."
             )
 
@@ -81,28 +85,38 @@ class MXFP4Quantizer(Quantizer):
                 "Install via: pip install -e /path/to/aiter"
             )
 
-        # Quantize using AITER's per_1x32_f4_quant_hip
-        fp4_data, e8m0_scale = aiter.ops.quant.per_1x32_f4_quant_hip(
-            src, shuffle=True
-        )
-
-        # Store rowwise quantized data
-        if dst._rowwise_data is not None:
-            dst._rowwise_data.copy_(fp4_data)
-            dst._rowwise_scale.copy_(e8m0_scale)
-
-        # Store columnwise quantized data if needed
-        if dst._columnwise_data is not None:
-            # For columnwise, we need to transpose first, then quantize
-            src_t = src.t().contiguous()
-            fp4_data_t, e8m0_scale_t = aiter.ops.quant.per_1x32_f4_quant_hip(
-                src_t, shuffle=True
+        # Quantize using AITER's triton quantizer
+        # Wrap in DisableTorchDispatch to prevent recursive dequantization, TODO revisit DisableTorchDispatch
+        with torch._C._DisableTorchDispatch():
+            quantizer = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+            fp4_data, e8m0_scale = quantizer(
+                src, shuffle=True
             )
-            dst._columnwise_data.copy_(fp4_data_t)
-            dst._columnwise_scale.copy_(e8m0_scale_t)
+
+            # Store rowwise quantized data
+            if dst._rowwise_data is not None:
+                dst._rowwise_data.copy_(fp4_data)
+                dst._rowwise_scale.copy_(e8m0_scale)
+
+            # Store columnwise quantized data (if needed)
+            if dst._columnwise_data is not None:
+                # For columnwise, we need to transpose first, then quantize
+                src_t = src.t().contiguous()
+                fp4_data_t, e8m0_scale_t = quantizer(
+                    src_t, shuffle=True
+                )
+                dst._columnwise_data.copy_(fp4_data_t)
+                dst._columnwise_scale.copy_(e8m0_scale_t)
 
         # Update FP4 dtype
         dst._fp4_dtype = self.dtype
+        
+        # Store original shape if it was 3D (for reshaping output after GEMM)
+        if len(original_shape) > 2:
+            dst._original_shape = original_shape
+        
+        # Cache high-precision tensor for potential dequantization
+        dst._data = src
 
         return dst
 
@@ -141,18 +155,19 @@ class MXFP4Quantizer(Quantizer):
         M = math.prod(shape[:-1])
         K = shape[-1]
 
-        # Allocate FP4 data: [M, K/2] uint8 (2 FP4 values per byte)
-        rowwise_data = torch.empty(M, K // 2, dtype=torch.uint8, device=device)
-        rowwise_scale = torch.empty(M, K // MXFP4_BLOCK_SCALING_SIZE, dtype=torch.uint8, device=device)
+        # Allocate FP4 data: [M, K/2] with proper FP4 dtype (not uint8!)
+        # AITER returns torch.float4_e2m1fn_x2, so we must use that dtype
+        rowwise_data = torch.empty(M, K // 2, dtype=torch.float4_e2m1fn_x2, device=device)
+        rowwise_scale = torch.empty(M, K // MXFP4_BLOCK_SCALING_SIZE, dtype=torch.float8_e8m0fnu, device=device)
 
         # Allocate FP4 data transpose if needed
         columnwise_data = None
         columnwise_scale = None
         if self.columnwise_usage:
             # For columnwise: [K, M/2] and [K, M/32]
-            columnwise_data = torch.empty(K, M // 2, dtype=torch.uint8, device=device)
+            columnwise_data = torch.empty(K, M // 2, dtype=torch.float4_e2m1fn_x2, device=device)
             columnwise_scale = torch.empty(
-                K, M // MXFP4_BLOCK_SCALING_SIZE, dtype=torch.uint8, device=device
+                K, M // MXFP4_BLOCK_SCALING_SIZE, dtype=torch.float8_e8m0fnu, device=device
             )
 
         # Construct FP4 tensor
@@ -165,6 +180,7 @@ class MXFP4Quantizer(Quantizer):
             columnwise_data=columnwise_data,
             columnwise_scale=columnwise_scale,
             quantizer=self,
+            original_shape=None,  # Will be set during update_quantized if needed
             requires_grad=requires_grad,
         )
 
