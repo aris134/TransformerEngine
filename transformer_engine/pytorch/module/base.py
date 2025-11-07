@@ -26,7 +26,7 @@ from transformer_engine.common.recipe import Recipe
 from ._common import _ParameterInitMeta, noop_cat
 from ..fp8 import (
     MXFP8BlockScalingRecipeState,
-    # MXFP4BlockScalingRecipeState,  # Not needed for FP4=1 env var hack
+    # MXFP4BlockScalingRecipeState,  # TODO during proper integration
     DelayedScalingRecipeState,
     Float8CurrentScalingRecipeState,
     Float8BlockScalingRecipeState,
