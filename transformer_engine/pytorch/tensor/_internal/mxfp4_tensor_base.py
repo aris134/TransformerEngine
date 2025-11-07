@@ -24,12 +24,19 @@ class _FromMXFP4Func(torch.autograd.Function):
         dtype: torch.dtype,
     ) -> torch.Tensor:
         # pylint: disable=missing-function-docstring
-        # For MXFP4, we need to dequantize from packed FP4 to high precision
-        # This will be implemented when we have AITER dequantization support
-        # For now, this is used only for backward pass which uses high precision
+        # For MXFP4, return cached high-precision data if available
+        # Full dequantization from FP4 will be implemented later with AITER support
+        if hasattr(tensor, '_data') and tensor._data is not None:
+            # Return cached high-precision data (used during model initialization/teardown)
+            return tensor._data.to(dtype) if tensor._data.dtype != dtype else tensor._data
+        
+        # If no cached data, we would need to dequantize from rowwise FP4 data
+        # This path should not be hit in forward-only MXFP4 training
+
+        # TODO: Implement MXFP4 dequantization from packed FP4 using AITER kernels
         raise NotImplementedError(
-            "MXFP4 dequantization not yet implemented. "
-            "Backward pass should use high precision tensors."
+            "MXFP4 dequantization from packed FP4 not yet implemented. "
+            "This should only be called during model teardown with cached high-precision data."
         )
 
     @staticmethod
@@ -62,6 +69,7 @@ class MXFP4TensorBase(QuantizedTensorBase):
     _fp4_dtype: TE_DType
     _rowwise_scale: torch.Tensor  # [M, K/32] uint8 E8M0
     _columnwise_scale: torch.Tensor  # [K, M/32] uint8 E8M0
+    _original_shape: Optional[Tuple[int, ...]]  # Original shape before reshape (for 3D inputs)
 
     def __new__(
         cls,
@@ -72,6 +80,7 @@ class MXFP4TensorBase(QuantizedTensorBase):
         columnwise_scale: torch.Tensor,
         fp4_dtype: TE_DType,
         quantizer: Optional[Quantizer] = None,
+        original_shape: Optional[Tuple[int, ...]] = None,
         **kwargs,
     ):
         instance = super().__new__(cls, *args, **kwargs)
@@ -81,6 +90,7 @@ class MXFP4TensorBase(QuantizedTensorBase):
         instance._fp4_dtype = fp4_dtype
         instance._rowwise_scale = rowwise_scale
         instance._columnwise_scale = columnwise_scale
+        instance._original_shape = original_shape
 
         return instance
 
