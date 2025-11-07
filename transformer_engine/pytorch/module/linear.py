@@ -8,6 +8,7 @@
 from typing import Callable, Dict, Optional, Tuple, Union
 from functools import reduce
 from operator import mul as multiply_op
+import os
 import warnings
 
 import torch
@@ -297,6 +298,15 @@ class _Linear(torch.autograd.Function):
         if IS_HIP_EXTENSION and fp8 and not keep_fp8_weight_transpose_cache:
                 assert weightmat._transpose is None or weightmat._transpose.numel() == 0, "Expected _transpose to be None or an empty tensor when transpose cache is disabled."
 
+        # MXFP4 DEBUG: Check tensor types before GEMM if debugging is enabled
+        if os.getenv("NVTE_MXFP4_DEBUG", "0") == "1":
+            from ..tensor._internal.mxfp4_tensor_base import MXFP4TensorBase
+            print(f"[{__file__}:303] [MXFP4 DEBUG] Before general_gemm:")
+            print(f"  weightmat type: {type(weightmat).__name__}")
+            print(f"  inputmat_total type: {type(inputmat_total).__name__}")
+            print(f"  weightmat is MXFP4TensorBase: {isinstance(weightmat, MXFP4TensorBase)}")
+            print(f"  inputmat_total is MXFP4TensorBase: {isinstance(inputmat_total, MXFP4TensorBase)}")
+        
         nvtx_range_push(f"{nvtx_label}.gemm")
         gemm_out, *_, reduce_scatter_out = general_gemm(
             weightmat,
@@ -1236,6 +1246,35 @@ class Linear(TransformerEngineBaseModule):
         else:
             self.gemm_bias_unfused_add = False
         
+        # MXFP4: Layer number detection for selective quantization
+        self._mxfp4_layer_number = None
+        self._mxfp4_layer_number_detected = False
+        self.register_forward_pre_hook(self._detect_layer_number_hook, with_kwargs=True)
+        
+    def _detect_layer_number_hook(self, module, args, kwargs):
+        """Forward pre-hook to detect layer_number from call stack (for MXFP4).
+        
+        Note: When registered as a bound method, PyTorch still passes module as first arg.
+        Signature: (self, module, args, kwargs) where module is self.
+        """
+        if not self._mxfp4_layer_number_detected:
+            import inspect
+            
+            # Walk the call stack to find TransformerLayer with layer_number
+            for frame_info in inspect.stack():
+                frame_locals = frame_info.frame.f_locals
+                if 'self' in frame_locals:
+                    obj = frame_locals['self']
+                    # Check if this is Megatron's TransformerLayer
+                    if (hasattr(obj, 'layer_number') and 
+                        hasattr(obj, '__class__') and
+                        'TransformerLayer' in obj.__class__.__name__):
+                        self._mxfp4_layer_number = obj.layer_number
+                        break
+            
+            # Mark as detected to avoid repeated stack walks
+            self._mxfp4_layer_number_detected = True
+    
     def set_meta_tensor(self, fwd: bool, recipe: Recipe) -> None:
         """Init scales and amaxes for fwd | bwd."""
         super().set_meta_tensor(fwd, recipe)
@@ -1425,47 +1464,79 @@ class Linear(TransformerEngineBaseModule):
         if not self.fp8:
             return [None] * 6
 
-        ############ MXFP4 OVERRIDE  ############
+        ############ MXFP4 LAYER-SELECTIVE QUANTIZATION ############
         import os
-        force_fp4 = int(os.getenv('FP4', '0')) == 1
         
-        if force_fp4:
-            # Hardcoded MXFP4 path: Forward uses FP4, backward uses high precision
-            # Force create MXFP4 quantizers if they don't exist
+        mxfp4_layers_env = os.getenv('MXFP4_LAYERS', '')
+        use_mxfp4 = False
+        
+        if mxfp4_layers_env and self._mxfp4_layer_number is not None:
+            if '-' in mxfp4_layers_env:
+                start, end = map(int, mxfp4_layers_env.split('-'))
+                use_mxfp4 = start <= self._mxfp4_layer_number <= end
+            elif ',' in mxfp4_layers_env:
+                target_layers = set(map(int, mxfp4_layers_env.split(',')))
+                use_mxfp4 = self._mxfp4_layer_number in target_layers
+        
+        if use_mxfp4:
             if not hasattr(self, '_mxfp4_quantizers_created'):
-                # Create MXFP4 quantizers
                 from ..tensor.mxfp4_tensor import MXFP4Quantizer
-                import transformer_engine_torch as tex
                 
-                mxfp4_quantizer = MXFP4Quantizer(fp4_dtype=tex.DType.kFloat4E2M1)
+                print(f"[MXFP4] Layer {self._mxfp4_layer_number}: Enabling MXFP4 forward GEMM, FP8 backward GEMMs")
                 
-                # Override the quantizers with MXFP4 ones
-                self.quantizers["scaling_fwd"][tex.FP8FwdTensors.GEMM1_INPUT] = mxfp4_quantizer
-                self.quantizers["scaling_fwd"][tex.FP8FwdTensors.GEMM1_WEIGHT] = MXFP4Quantizer(fp4_dtype=tex.DType.kFloat4E2M1)
+                # Create MXFP4 quantizers (forward-only)
+                input_quantizer = MXFP4Quantizer(
+                    fp4_dtype=tex.DType.kFloat4E2M1,
+                    rowwise=True,
+                    columnwise=False  # Forward-only, backward uses FP8
+                )
+                weight_quantizer = MXFP4Quantizer(
+                    fp4_dtype=tex.DType.kFloat4E2M1,
+                    rowwise=True,
+                    columnwise=False
+                )
+                
+                # Store MXFP4 quantizers in forward dict
+                self.quantizers["scaling_fwd"][tex.FP8FwdTensors.GEMM1_INPUT] = input_quantizer
+                self.quantizers["scaling_fwd"][tex.FP8FwdTensors.GEMM1_WEIGHT] = weight_quantizer
                 
                 self._mxfp4_quantizers_created = True
-                print(f"[OVERRIDE] Linear layer forced to use MXFP4 quantizers")
             
+            # Get MXFP4 quantizers for forward pass
             input_quantizer = self.quantizers["scaling_fwd"][tex.FP8FwdTensors.GEMM1_INPUT]
             weight_quantizer = self.quantizers["scaling_fwd"][tex.FP8FwdTensors.GEMM1_WEIGHT]
             
+            # Mark forward quantizers as internal
             if input_quantizer is not None:
                 input_quantizer.internal = True
             if weight_quantizer is not None:
                 weight_quantizer.internal = True
-                if IS_HIP_EXTENSION:
-                    weight_quantizer.set_usage(columnwise = self.keep_fp8_weight_transpose_cache)
             
-            # MXFP4 backward uses high precision (None quantizers)
+            # Get FP8 quantizers for backward pass (same as standard FP8 path)
+            grad_input_quantizer = None
+            grad_weight_quantizer = None
+            grad_output_quantizer = None
+            output_quantizer = None
+            
+            if fp8_output:
+                output_quantizer = self.quantizers["scaling_fwd"][tex.FP8FwdTensors.GEMM1_OUTPUT]
+            
+            if torch.is_grad_enabled():
+                # Backward uses standard FP8 quantizers (HIP FP8 GEMMs)
+                grad_output_quantizer = self.quantizers["scaling_bwd"][tex.FP8BwdTensors.GRAD_OUTPUT1]
+                grad_output_quantizer.internal = True
+                if fp8_grad:
+                    grad_input_quantizer = self.quantizers["scaling_bwd"][tex.FP8BwdTensors.GRAD_INPUT1]
+            
             return (
-                input_quantizer,
-                weight_quantizer,
-                None,  # output_quantizer - no FP4 output quantization
-                None,  # grad_input_quantizer - high precision backward
-                None,  # grad_weight_quantizer - high precision backward
-                None,  # grad_output_quantizer - high precision backward
+                input_quantizer,         # MXFP4 input (forward GEMM via AITER)
+                weight_quantizer,        # MXFP4 weight (forward GEMM via AITER)
+                output_quantizer,        # FP8 output (if fp8_output=True)
+                grad_input_quantizer,    # FP8 grad_input (backward dgrad GEMM via HIP)
+                grad_weight_quantizer,   # None (wgrad doesn't use quantized weights)
+                grad_output_quantizer,   # FP8 grad_output (backward dgrad/wgrad GEMMs via HIP)
             )
-        ############ END OVERRIDE ############
+        ############ END MXFP4 LAYER-SELECTIVE ############
 
         # Check if we're using MXFP4 recipe
         recipe = FP8GlobalStateManager.get_fp8_recipe()
