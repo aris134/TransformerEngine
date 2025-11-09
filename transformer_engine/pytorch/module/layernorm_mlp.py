@@ -67,6 +67,8 @@ from ..tensor.float8_tensor import (
     Float8Tensor,
 )
 from ..tensor.mxfp8_tensor import MXFP8Quantizer
+from ..tensor.mxfp4_tensor import MXFP4Quantizer
+from ..tensor._internal.mxfp4_tensor_base import MXFP4TensorBase
 from ..tensor.float8_blockwise_tensor import Float8BlockQuantizer
 from ._common import apply_normalization, WeightGradStore
 from ..cpu_offload import is_cpu_offload_enabled, mark_activation_offload
@@ -88,6 +90,13 @@ if IS_HIP_EXTENSION:
     from ..triton_kernels.rmsnorm import te_rmsnorm_bwd_triton
 
 __all__ = ["LayerNormMLP"]
+
+
+def print_rank_0(*args, **kwargs):
+    """Print only from rank 0 to avoid duplicate logs in distributed training."""
+    import torch.distributed as dist
+    if (dist.get_rank() if dist.is_initialized() else 0) == 0:
+        print(*args, **kwargs)
 
 
 def _get_act_func_supported_list(recipe: Optional[Recipe] = None):
@@ -276,6 +285,10 @@ class _LayerNormMLP(torch.autograd.Function):
         if isinstance(fc1_input_quantizer, Float8BlockQuantizer):
             # Kernels not available for norm fusion.
             with_quantized_norm = False
+        
+        # MXFP4 quantization is not supported in normalization kernel (C++ backend doesn't recognize it)
+        if isinstance(fc1_input_quantizer, MXFP4Quantizer):
+            with_quantized_norm = False
 
         # Apply normalization
         ln_out, mu, rsigma = apply_normalization(
@@ -333,7 +346,20 @@ class _LayerNormMLP(torch.autograd.Function):
                         quantizer=quantizer,
                     )
         else:
+            # Check if using MXFP4 without columnwise support (FC1 input)
+            is_mxfp4_rowwise_only_fc1 = False
             if (fp8 or debug) and not with_quantized_norm:
+                is_mxfp4_rowwise_only_fc1 = (
+                    isinstance(fc1_input_quantizer, MXFP4Quantizer) 
+                    and not fc1_input_quantizer.columnwise_usage
+                )
+                
+                # Save original BF16 input if MXFP4 rowwise-only (for backward re-quantization)
+                if is_mxfp4_rowwise_only_fc1 and is_grad_enabled:
+                    ln_out_original = ln_out  # Save BF16 for backward
+                    if os.getenv("NVTE_MXFP4_DEBUG", "0") == "1":
+                        print_rank_0(f"[MXFP4 DEBUG] LayerNormMLP FC1: Saving original BF16 ln_out for backward (MXFP4 rowwise-only)")
+                
                 ln_out = fc1_input_quantizer(ln_out)
             ln_out_total = ln_out
 
@@ -452,15 +478,53 @@ class _LayerNormMLP(torch.autograd.Function):
         elif debug:
             fc1_out, *_ = fc1_outputs
             act_out = activation_func(fc1_out, None)
+            # Check if using MXFP4 without columnwise support (FC2 input)
+            is_mxfp4_rowwise_only_fc2 = (
+                isinstance(fc2_input_quantizer, MXFP4Quantizer) 
+                and not fc2_input_quantizer.columnwise_usage
+            )
+            # Save original BF16 input if MXFP4 rowwise-only (for backward re-quantization)
+            if is_mxfp4_rowwise_only_fc2 and is_grad_enabled:
+                act_out_original = act_out  # Save BF16 for backward
+                if os.getenv("NVTE_MXFP4_DEBUG", "0") == "1":
+                    print_rank_0(f"[MXFP4 DEBUG] LayerNormMLP FC2: Saving original BF16 act_out for backward (MXFP4 rowwise-only)")
             act_out = fc2_input_quantizer(act_out)
         else:
             fc1_out, *_ = fc1_outputs
             if fp8 and FP8GlobalStateManager.get_fp8_recipe().float8_block_scaling():
                 # tex.quantize does not support GELU fusion for blockwise.
                 act_out = activation_func(fc1_out, None)
+                # Check if using MXFP4 without columnwise support (FC2 input)
+                is_mxfp4_rowwise_only_fc2 = (
+                    isinstance(fc2_input_quantizer, MXFP4Quantizer) 
+                    and not fc2_input_quantizer.columnwise_usage
+                )
+                # Save original BF16 input if MXFP4 rowwise-only (for backward re-quantization)
+                if is_mxfp4_rowwise_only_fc2 and is_grad_enabled:
+                    act_out_original = act_out  # Save BF16 for backward
+                    if os.getenv("NVTE_MXFP4_DEBUG", "0") == "1":
+                        print_rank_0(f"[MXFP4 DEBUG] LayerNormMLP FC2: Saving original BF16 act_out for backward (MXFP4 rowwise-only)")
                 act_out = tex.quantize(act_out, fc2_input_quantizer)
             else:
-                act_out = activation_func(fc1_out, fc2_input_quantizer)
+                # Note: activation_func with fc2_input_quantizer does fusion, so we can't save original BF16 here
+                # For MXFP4, we need to do it separately
+                if fp8 or debug:
+                    is_mxfp4_rowwise_only_fc2 = (
+                        isinstance(fc2_input_quantizer, MXFP4Quantizer) 
+                        and not fc2_input_quantizer.columnwise_usage
+                    )
+                    if is_mxfp4_rowwise_only_fc2:
+                        # Compute activation without quantization, then quantize separately
+                        act_out = activation_func(fc1_out, None)
+                        if is_grad_enabled:
+                            act_out_original = act_out  # Save BF16 for backward
+                            if os.getenv("NVTE_MXFP4_DEBUG", "0") == "1":
+                                print_rank_0(f"[MXFP4 DEBUG] LayerNormMLP FC2: Saving original BF16 act_out for backward (MXFP4 rowwise-only)")
+                        act_out = fc2_input_quantizer(act_out)
+                    else:
+                        act_out = activation_func(fc1_out, fc2_input_quantizer)
+                else:
+                    act_out = activation_func(fc1_out, fc2_input_quantizer)
 
         if not is_grad_enabled:
             clear_tensor_data(fc1_out)
@@ -555,23 +619,58 @@ class _LayerNormMLP(torch.autograd.Function):
 
             ctx.fc1_weight_quantizer = fc1_weight_quantizer
             ctx.fc2_weight_quantizer = fc2_weight_quantizer
+            
+            # MXFP4 fix: Check if we have original BF16 inputs saved
+            has_mxfp4_original_fc1 = 'ln_out_original' in locals()
+            has_mxfp4_original_fc2 = 'act_out_original' in locals()
+            
+            # Use original BF16 inputs if MXFP4 rowwise-only (for backward re-quantization to FP8)
+            saved_ln_out = ln_out_original if has_mxfp4_original_fc1 else ln_out
+            saved_act_out = act_out_original if has_mxfp4_original_fc2 else act_out
+            
+            if has_mxfp4_original_fc1 and os.getenv("NVTE_MXFP4_DEBUG", "0") == "1":
+                print_rank_0(f"[MXFP4 DEBUG] LayerNormMLP: Using BF16 original ln_out for backward")
+            if has_mxfp4_original_fc2 and os.getenv("NVTE_MXFP4_DEBUG", "0") == "1":
+                print_rank_0(f"[MXFP4 DEBUG] LayerNormMLP: Using BF16 original act_out for backward")
+            
+            # MXFP4 fix: Store FP8 quantizers for wgrad if forward uses MXFP4
+            if isinstance(fc1_input_quantizer, MXFP4Quantizer):
+                ctx.fc1_wgrad_input_quantizer = Float8CurrentScalingQuantizer(
+                    fp8_dtype=tex.DType.kFloat8E4M3,
+                    device=inp.device,
+                    rowwise=False,
+                    columnwise=True
+                )
+            else:
+                ctx.fc1_wgrad_input_quantizer = None
+            
+            if isinstance(fc2_input_quantizer, MXFP4Quantizer):
+                ctx.fc2_wgrad_input_quantizer = Float8CurrentScalingQuantizer(
+                    fp8_dtype=tex.DType.kFloat8E4M3,
+                    device=inp.device,
+                    rowwise=False,
+                    columnwise=True
+                )
+            else:
+                ctx.fc2_wgrad_input_quantizer = None
+            
             if not fc1_weight.requires_grad:
                 if not return_layernorm_output:
-                    clear_tensor_data(ln_out)
-                ln_out = None
+                    clear_tensor_data(saved_ln_out if saved_ln_out is not ln_out else ln_out)
+                saved_ln_out = None
             if not fc2_weight.requires_grad:
-                clear_tensor_data(act_out)
-                act_out = None
+                clear_tensor_data(saved_act_out if saved_act_out is not act_out else act_out)
+                saved_act_out = None
             tensors_to_save, tensor_objects = prepare_for_saving(
                 inputmat,
                 ln_weight,
-                ln_out,
+                saved_ln_out,
                 fc1_weight_final,
                 fc1_weight,
                 fc1_bias,
                 fc1_out,
                 fc1_out_without_bias,
-                act_out,
+                saved_act_out,
                 fc2_weight_final,
                 fc2_weight,
                 fc2_bias,
@@ -819,7 +918,25 @@ class _LayerNormMLP(torch.autograd.Function):
             # Make sure required data is available
             if isinstance(grad_output, QuantizedTensorBase):
                 grad_output.update_usage(rowwise_usage=True)
-            if ctx.fc2_weight_quantizer is not None and isinstance(
+            
+            # MXFP4 fix: Convert MXFP4 FC2 weight to FP8 for backward dgrad
+            if isinstance(fc2_weight, MXFP4TensorBase):
+                # MXFP4 forward, FP8 backward: dequantize and re-quantize
+                if os.getenv("NVTE_MXFP4_DEBUG", "0") == "1":
+                    print_rank_0(f"[MXFP4 DEBUG] LayerNormMLP FC2 Dgrad: Converting MXFP4 weight to FP8 (columnwise)")
+                
+                # Dequantize MXFP4 weight to BF16
+                fc2_weight_bf16 = fc2_weight.dequantize(dtype=torch.bfloat16)
+                
+                # Re-quantize to FP8 (columnwise) for dgrad GEMM
+                fc2_weight_fp8_quantizer = Float8CurrentScalingQuantizer(
+                    fp8_dtype=tex.DType.kFloat8E4M3,
+                    device=fc2_weight_bf16.device,
+                    rowwise=False,
+                    columnwise=True
+                )
+                fc2_weight = fc2_weight_fp8_quantizer(fc2_weight_bf16)
+            elif ctx.fc2_weight_quantizer is not None and isinstance(
                 fc2_weight, QuantizedTensorBase
             ):
                 fc2_weight.update_usage(columnwise_usage=True)
@@ -873,8 +990,19 @@ class _LayerNormMLP(torch.autograd.Function):
                     if isinstance(act_out, QuantizedTensorBase):
                         act_out.update_usage(columnwise_usage=True)
                     else:
-                        ctx.fc2_input_quantizer.set_usage(rowwise=False, columnwise=True)
-                        act_out = ctx.fc2_input_quantizer(act_out)
+                        # MXFP4 fix: For MXFP4 rowwise-only, act_out is BF16 (saved original)
+                        # Re-quantize to FP8 for wgrad GEMM (not MXFP4)
+                        if ctx.fc2_wgrad_input_quantizer is not None:
+                            # Use FP8 backward quantizer instead of MXFP4 for wgrad
+                            if os.getenv("NVTE_MXFP4_DEBUG", "0") == "1":
+                                print_rank_0(f"[MXFP4 DEBUG] LayerNormMLP FC2 Wgrad: Re-quantizing BF16 act_out to FP8 (not MXFP4)")
+                            ctx.fc2_wgrad_input_quantizer.set_usage(rowwise=False, columnwise=True)
+                            act_out = ctx.fc2_wgrad_input_quantizer(act_out)
+                            if os.getenv("NVTE_MXFP4_DEBUG", "0") == "1":
+                                print_rank_0(f"[MXFP4 DEBUG] LayerNormMLP FC2 Wgrad act_out type after FP8 quant: {type(act_out).__name__}")
+                        else:
+                            ctx.fc2_input_quantizer.set_usage(rowwise=False, columnwise=True)
+                            act_out = ctx.fc2_input_quantizer(act_out)
 
                 # Prepare grad output tensor
                 # Note: Synchronize tensor-parallel communication and
@@ -1047,7 +1175,24 @@ class _LayerNormMLP(torch.autograd.Function):
             # --------------------------------------------------
 
             # Make sure required data is available
-            if ctx.fc1_weight_quantizer is not None and isinstance(
+            # MXFP4 fix: Convert MXFP4 FC1 weight to FP8 for backward dgrad
+            if isinstance(fc1_weight, MXFP4TensorBase):
+                # MXFP4 forward, FP8 backward: dequantize and re-quantize
+                if os.getenv("NVTE_MXFP4_DEBUG", "0") == "1":
+                    print_rank_0(f"[MXFP4 DEBUG] LayerNormMLP FC1 Dgrad: Converting MXFP4 weight to FP8 (columnwise)")
+                
+                # Dequantize MXFP4 weight to BF16
+                fc1_weight_bf16 = fc1_weight.dequantize(dtype=torch.bfloat16)
+                
+                # Re-quantize to FP8 (columnwise) for dgrad GEMM
+                fc1_weight_fp8_quantizer = Float8CurrentScalingQuantizer(
+                    fp8_dtype=tex.DType.kFloat8E4M3,
+                    device=fc1_weight_bf16.device,
+                    rowwise=False,
+                    columnwise=True
+                )
+                fc1_weight = fc1_weight_fp8_quantizer(fc1_weight_bf16)
+            elif ctx.fc1_weight_quantizer is not None and isinstance(
                 fc1_weight, QuantizedTensorBase
             ):
                 fc1_weight.update_usage(columnwise_usage=True)
@@ -1125,8 +1270,19 @@ class _LayerNormMLP(torch.autograd.Function):
                     if isinstance(ln_out_total, QuantizedTensorBase):
                         ln_out_total.update_usage(columnwise_usage=True)
                     else:
-                        ctx.fc1_input_quantizer.set_usage(rowwise=False, columnwise=True)
-                        ln_out_total = ctx.fc1_input_quantizer(ln_out_total)
+                        # MXFP4 fix: For MXFP4 rowwise-only, ln_out_total is BF16 (saved original)
+                        # Re-quantize to FP8 for wgrad GEMM (not MXFP4)
+                        if ctx.fc1_wgrad_input_quantizer is not None:
+                            # Use FP8 backward quantizer instead of MXFP4 for wgrad
+                            if os.getenv("NVTE_MXFP4_DEBUG", "0") == "1":
+                                print_rank_0(f"[MXFP4 DEBUG] LayerNormMLP FC1 Wgrad: Re-quantizing BF16 ln_out to FP8 (not MXFP4)")
+                            ctx.fc1_wgrad_input_quantizer.set_usage(rowwise=False, columnwise=True)
+                            ln_out_total = ctx.fc1_wgrad_input_quantizer(ln_out_total)
+                            if os.getenv("NVTE_MXFP4_DEBUG", "0") == "1":
+                                print_rank_0(f"[MXFP4 DEBUG] LayerNormMLP FC1 Wgrad ln_out_total type after FP8 quant: {type(ln_out_total).__name__}")
+                        else:
+                            ctx.fc1_input_quantizer.set_usage(rowwise=False, columnwise=True)
+                            ln_out_total = ctx.fc1_input_quantizer(ln_out_total)
 
                 # Prepare grad output tensor
                 # Note: Synchronize tensor-parallel communication and
@@ -1687,6 +1843,34 @@ class LayerNormMLP(TransformerEngineBaseModule):
         self.fwd_ln_sm_margin = int(os.getenv("NVTE_FWD_LAYERNORM_SM_MARGIN", "0"))
         self.bwd_ln_sm_margin = int(os.getenv("NVTE_BWD_LAYERNORM_SM_MARGIN", "0"))
         self.inf_ln_sm_margin = int(os.getenv("NVTE_INF_LAYERNORM_SM_MARGIN", "0"))
+        
+        # MXFP4: Layer number detection for selective quantization
+        self._mxfp4_layer_number = None
+        self._mxfp4_layer_number_detected = False
+        self.register_forward_pre_hook(self._detect_layer_number_hook, with_kwargs=True)
+    
+    def _detect_layer_number_hook(self, module, args, kwargs):
+        """Forward pre-hook to detect layer_number from call stack (for MXFP4).
+        
+        Note: When registered with with_kwargs=True, PyTorch passes (module, args, kwargs).
+        """
+        if not self._mxfp4_layer_number_detected:
+            import inspect
+            
+            # Walk the call stack to find TransformerLayer with layer_number
+            for frame_info in inspect.stack():
+                frame_locals = frame_info.frame.f_locals
+                if 'self' in frame_locals:
+                    obj = frame_locals['self']
+                    # Check if this is Megatron's TransformerLayer
+                    if (hasattr(obj, 'layer_number') and 
+                        hasattr(obj, '__class__') and
+                        'TransformerLayer' in obj.__class__.__name__):
+                        self._mxfp4_layer_number = obj.layer_number
+                        break
+            
+            # Mark as detected to avoid repeated stack walks
+            self._mxfp4_layer_number_detected = True
 
     def set_meta_tensor(self, fwd: bool, recipe: Recipe) -> None:
         """Init scales and amaxes for fwd | bwd."""
@@ -1911,6 +2095,122 @@ class LayerNormMLP(TransformerEngineBaseModule):
             fc2_grad_weight_quantizer,
             fc2_grad_output_quantizer,
         ) = [None] * 12
+        
+        if not self.fp8:
+            return (
+                fc1_input_quantizer,
+                fc1_weight_quantizer,
+                fc1_output_quantizer,
+                fc1_grad_input_quantizer,
+                fc1_grad_weight_quantizer,
+                fc1_grad_output_quantizer,
+                fc2_input_quantizer,
+                fc2_weight_quantizer,
+                fc2_output_quantizer,
+                fc2_grad_input_quantizer,
+                fc2_grad_weight_quantizer,
+                fc2_grad_output_quantizer,
+            )
+        
+        ############ MXFP4 LAYER-SELECTIVE QUANTIZATION ############
+        mxfp4_layers_env = os.getenv('MXFP4_LAYERS', '')
+        use_mxfp4 = False
+        
+        if mxfp4_layers_env and self._mxfp4_layer_number is not None:
+            if '-' in mxfp4_layers_env:
+                start, end = map(int, mxfp4_layers_env.split('-'))
+                use_mxfp4 = start <= self._mxfp4_layer_number <= end
+            elif ',' in mxfp4_layers_env:
+                target_layers = set(map(int, mxfp4_layers_env.split(',')))
+                use_mxfp4 = self._mxfp4_layer_number in target_layers
+        
+        if use_mxfp4:
+            if not hasattr(self, '_mxfp4_quantizers_created'):
+                if os.getenv("NVTE_MXFP4_DEBUG", "0") == "1":
+                    print_rank_0(f"[MXFP4] LayerNormMLP Layer {self._mxfp4_layer_number}: Enabling MXFP4 forward GEMMs (FC1 & FC2), FP8 backward GEMMs")
+                
+                # Create MXFP4 quantizers for both FC1 and FC2 (forward-only)
+                fc1_input_quantizer = MXFP4Quantizer(
+                    fp4_dtype=tex.DType.kFloat4E2M1,
+                    rowwise=True,
+                    columnwise=False  # Forward-only, backward uses FP8
+                )
+                fc1_weight_quantizer = MXFP4Quantizer(
+                    fp4_dtype=tex.DType.kFloat4E2M1,
+                    rowwise=True,
+                    columnwise=False
+                )
+                fc2_input_quantizer = MXFP4Quantizer(
+                    fp4_dtype=tex.DType.kFloat4E2M1,
+                    rowwise=True,
+                    columnwise=False
+                )
+                fc2_weight_quantizer = MXFP4Quantizer(
+                    fp4_dtype=tex.DType.kFloat4E2M1,
+                    rowwise=True,
+                    columnwise=False
+                )
+                
+                # Store MXFP4 quantizers in forward dict
+                self.quantizers["scaling_fwd"][tex.FP8FwdTensors.GEMM1_INPUT] = fc1_input_quantizer
+                self.quantizers["scaling_fwd"][tex.FP8FwdTensors.GEMM1_WEIGHT] = fc1_weight_quantizer
+                self.quantizers["scaling_fwd"][tex.FP8FwdTensors.GEMM2_INPUT] = fc2_input_quantizer
+                self.quantizers["scaling_fwd"][tex.FP8FwdTensors.GEMM2_WEIGHT] = fc2_weight_quantizer
+                
+                self._mxfp4_quantizers_created = True
+            
+            # Get MXFP4 quantizers for forward pass
+            fc1_input_quantizer = self.quantizers["scaling_fwd"][tex.FP8FwdTensors.GEMM1_INPUT]
+            fc1_weight_quantizer = self.quantizers["scaling_fwd"][tex.FP8FwdTensors.GEMM1_WEIGHT]
+            fc2_input_quantizer = self.quantizers["scaling_fwd"][tex.FP8FwdTensors.GEMM2_INPUT]
+            fc2_weight_quantizer = self.quantizers["scaling_fwd"][tex.FP8FwdTensors.GEMM2_WEIGHT]
+            
+            # Mark forward quantizers as internal
+            if fc1_input_quantizer is not None:
+                fc1_input_quantizer.internal = True
+            if fc1_weight_quantizer is not None:
+                fc1_weight_quantizer.internal = True
+            if fc2_input_quantizer is not None:
+                fc2_input_quantizer.internal = True
+            if fc2_weight_quantizer is not None:
+                fc2_weight_quantizer.internal = True
+            
+            # Get FP8 quantizers for backward pass (same as standard FP8 path)
+            fc1_output_quantizer = None
+            fc1_grad_input_quantizer = None
+            fc1_grad_weight_quantizer = None
+            fc1_grad_output_quantizer = None
+            fc2_output_quantizer = None
+            fc2_grad_input_quantizer = None
+            fc2_grad_weight_quantizer = None
+            fc2_grad_output_quantizer = None
+            
+            if fp8_output:
+                fc2_output_quantizer = self.quantizers["scaling_fwd"][tex.FP8FwdTensors.GEMM2_OUTPUT]
+            
+            if torch.is_grad_enabled():
+                # Backward uses standard FP8 quantizers (HIP FP8 GEMMs)
+                fc2_grad_output_quantizer = self.quantizers["scaling_bwd"][tex.FP8BwdTensors.GRAD_OUTPUT2]
+                fc2_grad_output_quantizer.internal = True
+                fc1_grad_output_quantizer = self.quantizers["scaling_bwd"][tex.FP8BwdTensors.GRAD_OUTPUT1]
+                fc1_grad_output_quantizer.internal = True
+            
+            return (
+                fc1_input_quantizer,         # MXFP4 input (FC1 forward GEMM via AITER)
+                fc1_weight_quantizer,        # MXFP4 weight (FC1 forward GEMM via AITER)
+                fc1_output_quantizer,        # None
+                fc1_grad_input_quantizer,    # None
+                fc1_grad_weight_quantizer,   # None
+                fc1_grad_output_quantizer,   # FP8 (FC1 backward dgrad/wgrad via HIP)
+                fc2_input_quantizer,         # MXFP4 input (FC2 forward GEMM via AITER)
+                fc2_weight_quantizer,        # MXFP4 weight (FC2 forward GEMM via AITER)
+                fc2_output_quantizer,        # FP8 output (if fp8_output=True)
+                fc2_grad_input_quantizer,    # None
+                fc2_grad_weight_quantizer,   # None
+                fc2_grad_output_quantizer,   # FP8 (FC2 backward dgrad/wgrad via HIP)
+            )
+        ############ END MXFP4 LAYER-SELECTIVE ############
+        
         if self.fp8:
             fc1_input_quantizer = self.quantizers["scaling_fwd"][tex.FP8FwdTensors.GEMM1_INPUT]
             fc1_input_quantizer.internal = True
