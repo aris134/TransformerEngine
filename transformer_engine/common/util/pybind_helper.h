@@ -1,6 +1,6 @@
 /*************************************************************************
  * This file was modified for portability to AMDGPU
- * Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+ * Copyright (c) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
  * Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  * See LICENSE for license information.
@@ -50,9 +50,7 @@
       .value("ATOMIC_GEMM_AG_P2P", transformer_engine::CommOverlapAlgo::ATOMIC_GEMM_AG_P2P)        \
       .value("ATOMIC_GEMM_RS_P2P", transformer_engine::CommOverlapAlgo::ATOMIC_GEMM_RS_P2P)        \
       .value("EXTERNAL_BULK_OVERLAP_AG",                                                           \
-             transformer_engine::CommOverlapAlgo::EXTERNAL_BULK_OVERLAP_AG)                        \
-      .value("SPLIT_PIPELINED_AG_RD_P2P",                                                          \
-                transformer_engine::CommOverlapAlgo::SPLIT_PIPELINED_AG_RD_P2P);                   \
+             transformer_engine::CommOverlapAlgo::EXTERNAL_BULK_OVERLAP_AG);                       \
   py::class_<transformer_engine::CommOverlapCore,                                                  \
              std::shared_ptr<transformer_engine::CommOverlapCore>>(m, "CommOverlapCore",           \
                                                                    pybind11::module_local())       \

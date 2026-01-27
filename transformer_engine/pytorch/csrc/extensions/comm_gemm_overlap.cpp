@@ -1,6 +1,6 @@
 /*************************************************************************
  * This file was modified for portability to AMDGPU
- * Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+ * Copyright (c) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
  * Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  * See LICENSE for license information.
@@ -321,4 +321,3 @@ void transformer_engine::pytorch::bulk_overlap_ag_with_external_gemm(
                                                   at::cuda::CUDAStream(recv_stream), main_stream);
 }
 #endif
-  
